@@ -1,13 +1,17 @@
-name: PIA stock watch (night)
+name: PIA stock watch (cloud)
 
-# Runs on GitHub's servers while the PC is off. Public repo = free minutes.
+# Runs on GitHub's servers around the clock: every 5 minutes, day and night, while the
+# PC copy (every 20 s) only runs while the PC is on. Public repo = free minutes.
 # It can only NOTIFY; buying is still manual on the PIA page.
+# It switches itself off once DEADLINE_EPOCH has passed.
 
 on:
   schedule:
-    # UTC. 09:00-23:55 UTC == 18:00-08:55 JST (the user's PC is off then). GitHub's cron is best-effort:
-    # runs are often 5-20 min late at peak, so treat this as "~5-15 min" coverage.
-    - cron: '*/5 9-23 * * *'
+    # UTC, every 5 minutes (minutes 3, 8, 13, ...), offset from minute 0 and the top of
+    # the hour, which GitHub names as its busiest slots. GitHub's timer is best-effort:
+    # in this repo it has fired roughly once an hour, so it is a slow safety net.
+    # The day/month fields bound it to Nov 25-28, so nothing fires after the deadline day.
+    - cron: '3/5 * 25-28 11 *'
   workflow_dispatch:
     inputs:
       test_push:
@@ -15,20 +19,49 @@ on:
         type: boolean
         default: false
 
-permissions: {}
+permissions:
+  contents: read     # actions/checkout
+  actions: write     # lets the deadline step switch this workflow off
 
 concurrency:
   group: pia-watch
   cancel-in-progress: false
+
+env:
+  # 2026-11-28T05:00:00Z == 11/28 14:00 JST (Japan time): the last moment a ticket still helps.
+  DEADLINE_EPOCH: '1795842000'
 
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Deadline gate
+        id: gate
+        run: |
+          now=$(date -u +%s)
+          echo "now $(date -u -d "@$now" '+%F %T') UTC   deadline $(date -u -d "@$DEADLINE_EPOCH" '+%F %T') UTC"
+          if [ "$now" -ge "$DEADLINE_EPOCH" ]; then
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            echo "past the deadline: no more checks"
+          else
+            echo "active=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Best effort. If GitHub refuses, the cron's date bound still ends the runs on Nov 29.
+      - name: Turn off the schedule (deadline reached)
+        if: steps.gate.outputs.active != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow disable pia-watch.yml
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.active == 'true'
 
       - name: Restore previous stock snapshot
+        if: steps.gate.outputs.active == 'true'
         uses: actions/cache/restore@v4
         with:
           path: pia-state
@@ -36,6 +69,7 @@ jobs:
           restore-keys: pia-state-
 
       - name: Check stock
+        if: steps.gate.outputs.active == 'true'
         id: check
         run: |
           set +e
@@ -64,21 +98,22 @@ jobs:
       # !cancelled(): a red check (rc=2, some seat row failed) must not swallow a real
       # release seen in the rows that did parse.
       - name: Save snapshot
-        if: ${{ !cancelled() && steps.check.outputs.save == 'true' }}
+        if: ${{ !cancelled() && steps.gate.outputs.active == 'true' && steps.check.outputs.save == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: pia-state
           key: pia-state-${{ github.run_id }}
 
       - name: Push notification
-        if: ${{ !cancelled() && (steps.check.outputs.changed == 'true' || inputs.test_push == true) }}
+        if: ${{ !cancelled() && steps.gate.outputs.active == 'true' && (steps.check.outputs.changed == 'true' || inputs.test_push == true) }}
         env:
           PUSH_KEY: ${{ secrets.PUSH_KEY }}
         run: |
           body=$(awk '/STATE CHANGE/{f=1; next} f && NF {sub(/^ +/, ""); printf "%s; ", $0}' check.log | tr -d '\007' | cut -c1-400)
           if [ "${{ inputs.test_push }}" = "true" ]; then
-            body="TEST push from GitHub Actions - the night watcher is wired up. Real alerts look like: 2618278/007  Nov 28, 2026 18:00 (NHK Hall) / E seat -> AVAILABLE"
+            body="TEST push from GitHub Actions - the cloud watcher is wired up. Real alerts look like: 2618278/007  Nov 28, 2026 18:00 (NHK Hall) / E seat -> AVAILABLE"
           fi
           bash notify.sh "PIA 有票了 (NHKSO 2618278)" "$body"
+
 
 
